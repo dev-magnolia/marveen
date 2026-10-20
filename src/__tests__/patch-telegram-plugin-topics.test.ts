@@ -52,14 +52,14 @@ describe('patch-telegram-plugin.py --topics', () => {
     expect(readFileSync(server, 'utf-8')).not.toContain('tgtopics')
     const s = JSON.parse(readFileSync(state, 'utf-8'))
     expect(s.topics).toBe('off')
-    expect(s.files[0].patches).toEqual({ d4: 'patched', fwd: 'patched', evid: 'patched', kbd: 'patched' })
+    expect(s.files[0].patches).toEqual({ d4: 'patched', fwd: 'patched', evid: 'patched', kbd: 'patched', biz: 'patched' })
   })
 
   it('on: every step applied once, the file still parses, a second run is a byte-identical no-op', () => {
     const state = join(cache, 'state.json')
     const r = run(['--state', state, '--topics', 'on'])
     expect(r.status).toBe(0)
-    expect(r.stderr).toMatch(/patched .*\(d4, fwd, evid, kbd, topics\)/)
+    expect(r.stderr).toMatch(/patched .*\(d4, fwd, evid, kbd, biz, topics\)/)
     const once = readFileSync(server, 'utf-8')
     expect(syntaxErrors(once)).toEqual([])
     expect(JSON.parse(readFileSync(state, 'utf-8'))).toMatchObject({ topics: 'on', files: [{ patches: { topics: 'patched' } }] })
@@ -78,7 +78,31 @@ describe('patch-telegram-plugin.py --topics', () => {
     const r = run(['--state', state, '--topics', 'off'])
     expect(r.stderr).toMatch(/patched .*\(topics removed\)/)
     expect(readFileSync(server, 'utf-8')).toBe(neverSwitched)
-    expect(JSON.parse(readFileSync(state, 'utf-8')).files[0].patches).toEqual({ d4: 'already', fwd: 'already', evid: 'already', kbd: 'already', topics: 'removed' })
+    expect(JSON.parse(readFileSync(state, 'utf-8')).files[0].patches).toEqual({ d4: 'already', fwd: 'already', evid: 'already', kbd: 'already', biz: 'already', topics: 'removed' })
+  })
+
+  it('biz and topics in either order: a topics-patched file without biz gets biz, and topics off then leaves biz in', () => {
+    const neverSwitched = patched('off')
+    const code = [
+      'import importlib.util, sys',
+      "spec = importlib.util.spec_from_file_location('ptp', sys.argv[1])",
+      'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
+      "m.PATCHES = [p for p in m.PATCHES if p['name'] != 'biz']",
+      'sys.stdout.write(m.patch_text(sys.stdin.read(), True)[0])',
+    ].join('\n')
+    const old = spawnSync('python3', ['-c', code, SCRIPT], { input: readFileSync(FIXTURE, 'utf-8'), encoding: 'utf-8' })
+    expect(old.status).toBe(0)
+    expect(old.stdout).toContain(TAG)
+    expect(old.stdout).not.toContain('MARVEEN-PATCH(biz)')
+    writeFileSync(server, old.stdout)
+    const state = join(cache, 'state.json')
+    run(['--state', state, '--topics', 'on'])
+    const both = readFileSync(server, 'utf-8')
+    expect(JSON.parse(readFileSync(state, 'utf-8')).files[0].patches).toEqual({ d4: 'already', fwd: 'already', evid: 'already', kbd: 'already', biz: 'patched', topics: 'already' })
+    expect(both.split('\n').filter(l => l.includes('MARVEEN-PATCH(biz)'))).toHaveLength(5)
+    expect(syntaxErrors(both)).toEqual([])
+    run(['--topics', 'off'])
+    expect(readFileSync(server, 'utf-8')).toBe(neverSwitched)
   })
 
   it.each(['yes', 'true', '1', 'On', ''])('--topics %j: refused with exit 2, the plugin file and the state left alone', (value) => {
@@ -158,9 +182,13 @@ interface Plugin {
 }
 
 // Executes the excerpt with stand-ins for everything it does not define itself.
-// Only the Bot API calls and the MCP notifications are observed.
+// Only the Bot API calls and the MCP notifications are observed. The import
+// lines (the path import and the biz patch's module import) and the top-level
+// `await mcp.connect` cannot run in a plain function body: they are dropped,
+// and registerBusiness is a stand-in that adds no tool.
 function load(source: string): Plugin {
-  const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+  const body = source.split('\n').filter(l => !/^import /.test(l) && !/^await mcp\.connect\(/.test(l)).join('\n')
+  const js = ts.transpileModule(body, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
   const calls: Call[] = []
   const notes: Plugin['notes'] = []
   const handlers = new Map<unknown, (req: unknown) => Promise<unknown>>()
@@ -201,6 +229,7 @@ function load(source: string): Plugin {
     loadAccess: () => ({}),
     PHOTO_EXTS: new Set(['.png', '.jpg']),
     writeFileSync: () => {}, renameSync: () => {}, join, STATE_DIR: '/nonexistent',
+    registerBusiness: () => ({ tools: [], callTool: async () => ({ content: [] }) }),
   }
   const names = Object.keys(stubs)
   const factory = new Function(...names, `${js}\nreturn { handleInbound }`)

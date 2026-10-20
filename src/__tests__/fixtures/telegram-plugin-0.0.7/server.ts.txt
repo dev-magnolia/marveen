@@ -5,7 +5,11 @@
 // lines 391-418, 454-526 and 528-650). Test input for
 // scripts/patch-telegram-plugin.py (ELSOKOR922 spec D-4, the reply-keyboard
 // patch (c67f5f34) and the topics patch); the declarations and the loop's
-// closing lines only make the excerpt parse on its own.
+// closing lines only make the excerpt parse on its own. Two more verbatim
+// lines for the Telegram Business patch (biz): the path import (line 25) and
+// `await mcp.connect` (line 652, placed right after the server instructions
+// here so the excerpt still ends with the tool-call handler).
+import { join, extname, sep } from 'path'
 declare const bot: any
 declare function dmCommandGate(ctx: any): any
 let botUsername = ''
@@ -196,6 +200,8 @@ const mcp = new Server(
     ].join('\n'),
   },
 )
+
+await mcp.connect(new StdioServerTransport())
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [

@@ -3,7 +3,8 @@
 Take /status and /help away from the Telegram channel plugin (ELSOKOR922 D-4),
 mark forwarded messages in the inbound meta (forwarded="1"), record every
 inbound message the bot receives (the evidence owner WRITE commands need),
-and -- only while TELEGRAM_TOPICS_ENABLED is on -- carry the topic of a
+hand Telegram Business messages to the session with replies sent only after
+the account owner approves them (see BIZ_ANCHORS), and -- only while TELEGRAM_TOPICS_ENABLED is on -- carry the topic of a
 message in and the answer back into it (see TOPICS_STEPS).
 
 The official plugin (claude-plugins-official/telegram/<ver>/server.ts) answers
@@ -52,6 +53,9 @@ MARKER = "// MARVEEN-PATCH(elsokor922-d4): /status and /help belong to the comma
 FWD_MARKER = "// MARVEEN-PATCH(elsokor922-fwd): forwarded flag for the command hook"
 EVID_MARKER = "// MARVEEN-PATCH(cmd920-evid): inbound evidence for owner write commands"
 KBD_MARKER = "// MARVEEN-PATCH(c67f5f34-kbd): one-tap answer buttons"
+BIZ_MARKER = "// MARVEEN-PATCH(biz): Telegram Business messages and approved drafts"
+BIZ_MODULE = "marveen-business.ts"
+BIZ_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telegram-plugin", BIZ_MODULE)
 
 # Each anchor is the handler's full block, up to its closing `})` at column 0.
 ANCHORS = [
@@ -116,6 +120,35 @@ KBD_SEND = ("reply send options", re.compile(
     "kbdButtons.map(label => [{{ text: label }}]), one_time_keyboard: true, resize_keyboard: true }} : "
     "{{ remove_keyboard: true as const }} }} : {{}}), " + KBD_MARKER + "\n")
 
+# Telegram Business (Bud Parker, 2026-10-20): a bot connected to a person's
+# own account receives business_message updates from that person's private
+# chats, which the plugin has no handler for. The logic lives in its own file
+# (scripts/telegram-plugin/marveen-business.ts), copied next to server.ts;
+# five whole lines wire it in, each carrying the marker. The registration goes
+# before `await mcp.connect`: a tools/list request can arrive during that await,
+# and the bot handlers must come before the plugin's catch-all callback handler.
+# allowed_updates is set explicitly: without it Telegram keeps the list of the
+# previous getUpdates caller, and a test script that asked for message and
+# business updates only would silence the button presses (callback_query).
+# No anchor is a line the topics patch adds or replaces, so the two apply in
+# either order and taking topics off leaves these lines alone. The approved
+# draft goes out through bot.api.sendMessage inside the module, not through the
+# reply tool: a business chat is a private chat without topics.
+BIZ_ALLOWED = ("['message', 'edited_message', 'callback_query', 'my_chat_member', 'business_connection', "
+               "'business_message', 'edited_business_message', 'deleted_business_messages']")
+BIZ_ANCHORS = [
+    ("path import", re.compile(r"^( *)import \{ join, extname, sep \} from 'path'\n", re.MULTILINE), "insert-after",
+     "{indent}import {{ registerBusiness }} from './" + BIZ_MODULE + "' " + BIZ_MARKER + "\n"),
+    ("mcp connect", re.compile(r"^( *)await mcp\.connect\(new StdioServerTransport\(\)\)\n", re.MULTILINE), "insert-before",
+     "{indent}const marveenBiz = registerBusiness({{ bot, mcp, loadAccess, stateDir: STATE_DIR }}) " + BIZ_MARKER + "\n"),
+    ("edit_message tool schema", re.compile(r"^( *)\{\n *name: 'edit_message',\n", re.MULTILINE), "insert-before",
+     "{indent}...marveenBiz.tools, " + BIZ_MARKER + "\n"),
+    ("react tool call", re.compile(r"^( *)case 'react': \{\n", re.MULTILINE), "insert-before",
+     "{indent}case 'business_draft': return await marveenBiz.callTool(req.params.name, args) " + BIZ_MARKER + "\n"),
+    ("bot start", re.compile(r"^( *)await bot\.start\(\{\n", re.MULTILINE), "insert-after",
+     "{indent}  allowed_updates: " + BIZ_ALLOWED + ", " + BIZ_MARKER + "\n"),
+]
+
 # Independent patches: each has its own marker and is all-or-nothing on its
 # own, so a plugin update that moves one anchor does not undo the other.
 PATCHES = [
@@ -130,6 +163,9 @@ PATCHES = [
     # an anchor may carry its own mode and insert (name, regex, mode, insert): the three kbd lines differ
     {"name": "kbd", "marker": KBD_MARKER, "anchors": [KBD_SCHEMA, KBD_CHECK, KBD_SEND], "mode": "insert-after",
      "fallback": "the reply tool has no buttons: a question goes out without them and is answered by typing"},
+    # "module": a file copied next to server.ts first; without it the patch is left out
+    {"name": "biz", "marker": BIZ_MARKER, "anchors": BIZ_ANCHORS, "mode": "insert-after", "module": BIZ_MODULE,
+     "fallback": "Telegram Business messages are not delivered and no draft can be sent"},
 ]
 
 # Topics (TELEGRAM_TOPICS_ENABLED, default off). A private chat with topic mode
@@ -254,11 +290,45 @@ def remove_topics(text):
 TOPICS_PATCH = {"name": "topics", "fallback": TOPICS_FALLBACK}
 
 
-def patch_text(text, topics=False):
+def install_module(dirpath, name):
+    """Copies scripts/telegram-plugin/<name> next to server.ts when missing or
+    different. Returns True when the file there matches the source."""
+    src = os.path.join(os.path.dirname(BIZ_SOURCE), name)
+    dst = os.path.join(dirpath, name)
+    try:
+        with open(src, encoding="utf-8") as f:
+            want = f.read()
+    except Exception as e:
+        log(f"cannot read module {src}: {type(e).__name__}")
+        return False
+    try:
+        with open(dst, encoding="utf-8") as f:
+            if f.read() == want:
+                return True
+    except Exception:
+        pass
+    try:
+        with open(dst + ".marveen-tmp", "w", encoding="utf-8") as f:
+            f.write(want)
+        os.replace(dst + ".marveen-tmp", dst)
+        log(f"installed {dst}")
+        return True
+    except Exception as e:
+        log(f"cannot write module {dst}: {type(e).__name__}")
+        return False
+
+
+def patch_text(text, topics=False, modules_ok=None):
     """Returns (new_text, [(patch, status), ...]). The topics entry is there
-    when the switch is on, or when switching it off took the patch out."""
+    when the switch is on, or when switching it off took the patch out.
+    modules_ok: module file name -> installed; a patch whose module is not
+    installed is left out (its import would stop the plugin from starting)."""
     results = []
     for patch in PATCHES:
+        mod = patch.get("module")
+        if mod and patch["marker"] not in text and not (modules_ok or {}).get(mod):
+            results.append((patch, f"anchor-missing:{mod} not installed"))
+            continue
         text, status = apply_patch(text, patch)
         results.append((patch, status))
     if topics:
@@ -290,7 +360,9 @@ def patch_file(path, topics=False):
     except Exception as e:
         log(f"cannot read {path}: {type(e).__name__}")
         return "unreadable", {}
-    new, results = patch_text(text, topics)
+    dirpath = os.path.dirname(path)
+    modules_ok = {p["module"]: install_module(dirpath, p["module"]) for p in PATCHES if p.get("module")}
+    new, results = patch_text(text, topics, modules_ok)
     per_patch = {p["name"]: st for p, st in results}
     for patch, status in results:
         if status.startswith("anchor-missing"):
