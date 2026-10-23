@@ -123,6 +123,15 @@ SESSION="${MAIN_AGENT_ID}-channels"
 CHANNEL_PROVIDER="$(grep -E '^CHANNEL_PROVIDER=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
 CHANNEL_PROVIDER="${CHANNEL_PROVIDER:-telegram}"
 CHANNEL_PROVIDER="${CHANNEL_PROVIDER//[^a-zA-Z0-9_-]/}"
+# The plugin dir is not always the provider name: the slack provider's plugin
+# is slack-channel, so grepping /slack/ never matched and the probe was a no-op
+# on every Slack install (the main session was keepalive-respawned 6 times on
+# 2026-10-23 alone, each one losing the conversation). Same mapping as
+# PLUGIN_SEG in scripts/channels.sh.
+case "$CHANNEL_PROVIDER" in
+  slack) PLUGIN_SEG="/slack-channel" ;;
+  *)     PLUGIN_SEG="/${CHANNEL_PROVIDER}" ;;
+esac
 
 TMUX_BIN="$(command -v tmux)"
 if [ -z "$TMUX_BIN" ]; then
@@ -185,7 +194,7 @@ while read -r cand; do
     alive=1
     break
   fi
-done < <(ps -axo pid,command 2>/dev/null | grep -E "$RUNTIME_TOKEN_RX" | grep -F "/${CHANNEL_PROVIDER}/" | grep -v grep | awk '{print $1}')
+done < <(ps -axo pid,command 2>/dev/null | grep -E "$RUNTIME_TOKEN_RX" | grep -F "${PLUGIN_SEG}/" | grep -v grep | awk '{print $1}')
 
 if [ "$alive" -ne 1 ]; then
   # Do NOT advance the keepalive: a dead pipe must stay visibly stale so a real

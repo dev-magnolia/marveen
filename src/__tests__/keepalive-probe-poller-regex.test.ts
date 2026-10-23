@@ -43,10 +43,18 @@ describe('the probe matches the CONFIGURED provider, not a hardcoded telegram', 
     expect(src).toContain('CHANNEL_PROVIDER="${CHANNEL_PROVIDER:-telegram}"')
   })
 
+  // The slack provider's plugin dir is slack-channel, not slack: grepping
+  // /slack/ never matched the live node poller, so the probe never advanced
+  // the keepalive on a Slack install and the quiet main session was respawned.
+  it('maps the slack provider to the slack-channel plugin dir', () => {
+    expect(src).toContain('slack) PLUGIN_SEG="/slack-channel" ;;')
+    expect(src).toContain('*)     PLUGIN_SEG="/${CHANNEL_PROVIDER}" ;;')
+  })
+
   it('filters candidate pollers by the resolved provider dir', () => {
     const pollerScan = src.split('\n').find((l) => l.includes('ps -axo pid,command'))
     expect(pollerScan, 'poller scan line not found').toBeDefined()
-    expect(pollerScan).toContain('"/${CHANNEL_PROVIDER}/"')
+    expect(pollerScan).toContain('"${PLUGIN_SEG}/"')
     expect(pollerScan).not.toContain("'/telegram/'")
   })
 })
