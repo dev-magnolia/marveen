@@ -35,7 +35,14 @@ describe('channels.sh watchdog plugin-liveness fallback is scoped to this sessio
 
   it('the fallback check is a pgrep -P scoped to _watchdog_claude_pid, not a host-wide ps scan', () => {
     const loop = extractWatchdogLoop()
-    expect(loop).toMatch(/pgrep -P "\$_watchdog_claude_pid" bun/)
+    expect(loop).toMatch(/plugin_poller_child "\$_watchdog_claude_pid"/)
+    // The helper itself must stay pgrep -P scoped to the pid it is given.
+    const fnStart = channelsSh.indexOf('plugin_poller_child() {')
+    expect(fnStart, 'plugin_poller_child() not found').toBeGreaterThan(0)
+    const fn = channelsSh.slice(fnStart, channelsSh.indexOf('\n}\n', fnStart))
+    expect(fn).toMatch(/pgrep -P "\$1" bun/)
+    expect(fn).toMatch(/pgrep -P "\$1" -f "\/plugins\/cache\/\[\^\/\]\+\$\{PLUGIN_SEG\}\/"/)
+    expect(fn).not.toMatch(/ps (eww -e|axeww)/)
   })
 
   it('never falls back to the old unscoped `ps eww -e | grep CLAUDE_PLUGIN_ROOT` host-wide scan', () => {
@@ -53,7 +60,7 @@ describe('channels.sh watchdog plugin-liveness fallback is scoped to this sessio
 
   it('guards against an empty pane_pid before calling pgrep (no bare pgrep -P "" )', () => {
     const loop = extractWatchdogLoop()
-    const fallbackIdx = loop.indexOf('pgrep -P "$_watchdog_claude_pid" bun')
+    const fallbackIdx = loop.indexOf('plugin_poller_child "$_watchdog_claude_pid"')
     expect(fallbackIdx).toBeGreaterThan(0)
     const precedingLine = loop.slice(0, fallbackIdx)
     const lastIf = precedingLine.lastIndexOf('if [')
@@ -96,6 +103,29 @@ describe('pgrep -P scoping primitive (proves the mechanism, not just the source 
         unrelatedHit = execFileSync('/usr/bin/pgrep', ['-P', String(child.pid), 'sleep'], { encoding: 'utf-8' }).trim()
       } catch { /* pgrep exits 1 on no match -- that IS the expected "not found" */ }
       expect(unrelatedHit).toBe('')
+    } finally {
+      child.kill('SIGKILL')
+    }
+  })
+})
+
+// PLUGINNODEPOLLER1023: the slack-channel poller is a node process, not bun.
+// Proves the argv half of plugin_poller_child on this host: a child whose argv
+// carries the provider's plugin cache dir is found under its real parent, and
+// another provider's pattern does not match it.
+describe('plugin_poller_child argv probe (node plugin pollers)', () => {
+  it('finds a node child carrying the slack-channel cache dir, and only for that provider', async () => {
+    const fakeRoot = '/home/x/.claude/plugins/cache/marveen-marketplace/slack-channel/0.2.3/server.ts'
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)', fakeRoot], { stdio: 'ignore' })
+    const probe = (seg: string): string => {
+      try {
+        return execFileSync('/usr/bin/pgrep', ['-P', String(process.pid), '-f', `/plugins/cache/[^/]+${seg}/`], { encoding: 'utf-8' }).trim()
+      } catch { return '' }
+    }
+    try {
+      await new Promise(r => setTimeout(r, 300))
+      expect(probe('/slack-channel')).toBe(String(child.pid))
+      expect(probe('/telegram')).toBe('')
     } finally {
       child.kill('SIGKILL')
     }

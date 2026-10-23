@@ -1323,6 +1323,20 @@ case "$CHANNEL_PROVIDER" in
   slack) PLUGIN_SEG="/slack-channel" ;;
   *)     PLUGIN_SEG="/${CHANNEL_PROVIDER}" ;;
 esac
+# PLUGINNODEPOLLER1023: is this session's channel poller running? Prints the
+# first matching child pid of the given claude pid, nothing when there is none.
+# Two shapes count: a `bun` child (the telegram plugin runs on bun) and a child
+# whose argv carries the provider's plugin cache dir (the slack-channel plugin
+# runs on node/tsx). The probes used to look for `bun` only, so on a Slack
+# install the plugin always read as "never started": the watchdog restarted a
+# healthy main session every budget window (254 in a row, measured 2026-10-16..23)
+# and the post-init unlock typed /mcp into it. Same rule as hasPluginPollerChild
+# in src/web/channel-plugin-unlock.ts. Scoped to the given parent (pgrep -P),
+# never host-wide -- see kanban c0390130 below.
+plugin_poller_child() {
+  [ -n "$1" ] || return 0
+  { /usr/bin/pgrep -P "$1" bun; /usr/bin/pgrep -P "$1" -f "/plugins/cache/[^/]+${PLUGIN_SEG}/"; } 2>/dev/null | head -1
+}
 ORPHAN_PIDS2="$(/bin/ps axeww 2>/dev/null | awk -v needle="CLAUDE_PLUGIN_ROOT=" -v prov="$PLUGIN_SEG" -v subdir="${INSTALL_DIR}/agents/" '$0 ~ (needle "[^ ]*" prov "([/@ ]|$)") && index($0, subdir) == 0 { print $1 }')"
 if [ -n "$ORPHAN_PIDS2" ]; then
   # shellcheck disable=SC2086
@@ -1749,7 +1763,8 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
 #
 # Two-stage detection, both must indicate "no plugin" before we fire keystrokes:
 #
-#   1. pgrep -P claude_pid bun   -- looks for a bun child of the marveen-channels
+#   1. plugin_poller_child claude_pid -- looks for the poller child (bun, or the
+#      node slack-channel plugin; PLUGINNODEPOLLER1023) of the marveen-channels
 #      claude process. This catches the case the env-var grep misses: Claude Code
 #      does NOT inherit TELEGRAM_STATE_DIR into the spawned poller on the main
 #      session (only on sub-agents), so an env-var-needle scan reports "no
@@ -1785,7 +1800,7 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
   # Check 1: bun grandchild of the marveen-channels claude
   BUN_CHILD=""
   if [ -n "$CLAUDE_PID" ]; then
-    BUN_CHILD="$(/usr/bin/pgrep -P "$CLAUDE_PID" bun 2>/dev/null | head -1)"
+    BUN_CHILD="$(plugin_poller_child "$CLAUDE_PID")"
   fi
   if [ -n "$BUN_CHILD" ]; then
     # Plugin is alive via the authoritative process-tree check. Don't probe the
@@ -1895,7 +1910,7 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
     for _w in 1 2 3 4 5 6 7 8 9 10 11 12; do
       sleep 5
       if [ -n "$CLAUDE_PID" ]; then
-        BUN_AFTER="$(/usr/bin/pgrep -P "$CLAUDE_PID" bun 2>/dev/null | head -1)"
+        BUN_AFTER="$(plugin_poller_child "$CLAUDE_PID")"
       fi
       [ -n "$BUN_AFTER" ] && break
     done
@@ -2118,7 +2133,7 @@ while $TMUX has-session -t "=$SESSION:" 2>/dev/null; do
   # installs never saw this because there was only ever one plugin process to
   # find, and it happened to be the right one.
   if [ "$_plugin_alive" != "true" ] && [ "$_bot_hijacked" != "true" ]; then
-    if [ -n "$_watchdog_claude_pid" ] && /usr/bin/pgrep -P "$_watchdog_claude_pid" bun >/dev/null 2>&1; then
+    if [ -n "$_watchdog_claude_pid" ] && [ -n "$(plugin_poller_child "$_watchdog_claude_pid")" ]; then
       _plugin_alive=true
     fi
   fi
